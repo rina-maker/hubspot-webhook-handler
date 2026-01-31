@@ -125,7 +125,15 @@ export async function GET() {
     // You previously learned InvoiceDate requires UTC datetime like yyyy-MM-ddTHH:mm:ssZ.
     //
     // Replace this querystring with the exact one that worked in Postman.
-    const cin7Url = `${baseUrl}${path}?InvoiceDate=${encodeURIComponent(since)}`;
+    const where = `invoiceDate >= '${since}' AND invoiceDate IS NOT NULL`;
+
+const cin7Url =
+  `${baseUrl}${path}` +
+  `?where=${encodeURIComponent(where)}` +
+  `&fields=id,reference,invoiceDate,stage,deliveryFirstName,deliveryLastName,deliveryCompany,deliveryAddress1,deliveryAddress2,deliveryCity,deliveryState,deliveryPostalCode,deliveryCountry,freightTotal,productTotal,total` +
+  `&order=invoiceDate` +
+  `&rows=50` +
+  `&page=1`;
 
     console.log("[cin7-sync] started", { startedAt, since, cin7Url });
 
