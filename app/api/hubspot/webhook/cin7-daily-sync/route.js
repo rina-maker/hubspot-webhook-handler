@@ -91,12 +91,14 @@ function pickExistingProps(allNamesSet, candidateProps) {
  * If an order with that cin7_order_id exists -> update.
  * If not -> create.
  */
-async function batchUpsertOrders(inputs, idProperty = "cin7_order_id") {
-  return hubspotFetchJson("/crm/v3/objects/orders/batch/upsert", {
-    method: "POST",
-    body: { idProperty, inputs },
-  });
-}
+console.log("[cin7-sync] upsert request meta", {
+  idProperty: UNIQUE_PROP,
+  chunkSize: chunk.length,
+  sampleId: chunk?.[0]?.id,
+  hasIdProperty: Boolean(UNIQUE_PROP),
+});
+
+async function batchUpsertOrders
 
 export async function GET() {
   const startedAt = new Date().toISOString();
