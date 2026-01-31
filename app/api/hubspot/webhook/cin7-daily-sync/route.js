@@ -98,8 +98,17 @@ console.log("[cin7-sync] upsert request meta", {
   hasIdProperty: Boolean(UNIQUE_PROP),
 });
 
-async function batchUpsertOrders
+async function batchUpsertOrders(inputs, idProperty) {
+  if (!idProperty) throw new Error("Missing idProperty for HubSpot upsert.");
+  if (!Array.isArray(inputs)) throw new Error("inputs must be an array.");
 
+  const body = { idProperty, inputs };
+
+  return hubspotFetchJson("/crm/v3/objects/orders/batch/upsert", {
+    method: "POST",
+    body,
+  });
+}
 export async function GET() {
   const startedAt = new Date().toISOString();
 
