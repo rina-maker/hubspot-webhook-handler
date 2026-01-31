@@ -91,13 +91,6 @@ function pickExistingProps(allNamesSet, candidateProps) {
  * If an order with that cin7_order_id exists -> update.
  * If not -> create.
  */
-console.log("[cin7-sync] upsert request meta", {
-  idProperty: UNIQUE_PROP,
-  chunkSize: chunk.length,
-  sampleId: chunk?.[0]?.id,
-  hasIdProperty: Boolean(UNIQUE_PROP),
-});
-
 async function batchUpsertOrders(inputs, idProperty) {
   if (!idProperty) throw new Error("Missing idProperty for HubSpot upsert.");
   if (!Array.isArray(inputs)) throw new Error("inputs must be an array.");
