@@ -1,5 +1,8 @@
 export const runtime = "nodejs";
 
+/**
+ * Env helpers
+ */
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -11,6 +14,17 @@ function isoUtcHoursAgo(hours) {
   return d.toISOString().replace(/\.\d{3}Z$/, "Z"); // trim millis
 }
 
+function safeJsonParse(text) {
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return { _raw: text };
+  }
+}
+
+/**
+ * Cin7
+ */
 async function cin7FetchJson(url) {
   const username = requireEnv("CIN7_USERNAME");
   const key = requireEnv("CIN7_KEY");
@@ -30,10 +44,12 @@ async function cin7FetchJson(url) {
     throw new Error(`Cin7 error ${resp.status}: ${text}`);
   }
 
-  // Cin7 sometimes returns empty strings; guard it
-  return text ? JSON.parse(text) : {};
+  return safeJsonParse(text);
 }
 
+/**
+ * HubSpot
+ */
 async function hubspotFetchJson(path, { method = "GET", body } = {}) {
   const token = requireEnv("HUBSPOT_PRIVATE_APP_TOKEN");
 
@@ -51,14 +67,13 @@ async function hubspotFetchJson(path, { method = "GET", body } = {}) {
   if (!resp.ok) {
     throw new Error(`HubSpot error ${resp.status}: ${text}`);
   }
-  return text ? JSON.parse(text) : {};
+
+  return safeJsonParse(text);
 }
 
 async function getHubSpotOrderPropertyNames() {
-  // Grab available properties so we only write ones that exist in your portal
   const props = await hubspotFetchJson("/crm/v3/properties/orders");
-  const names = new Set((props?.results || []).map((p) => p.name));
-  return names;
+  return new Set((props?.results || []).map((p) => p.name));
 }
 
 function pickExistingProps(allNamesSet, candidateProps) {
@@ -70,45 +85,16 @@ function pickExistingProps(allNamesSet, candidateProps) {
   return out;
 }
 
-async function findOrderByUniqueProperty(uniquePropName, uniqueValue) {
-  // Use CRM search to find an existing HubSpot order by a unique Cin7 identifier
-  // NOTE: this requires that uniquePropName exists as an Order property in HubSpot.
-  const body = {
-    filterGroups: [
-      {
-        filters: [
-          {
-            propertyName: uniquePropName,
-            operator: "EQ",
-            value: uniqueValue,
-          },
-        ],
-      },
-    ],
-    properties: [uniquePropName],
-    limit: 1,
-  };
-
-  const res = await hubspotFetchJson("/crm/v3/objects/orders/search", {
+/**
+ * True idempotency:
+ * Batch upsert Orders by a unique property (cin7_order_id).
+ * If an order with that cin7_order_id exists -> update.
+ * If not -> create.
+ */
+async function batchUpsertOrders(inputs, idProperty = "cin7_order_id") {
+  return hubspotFetchJson("/crm/v3/objects/orders/batch/upsert", {
     method: "POST",
-    body,
-  });
-
-  const found = res?.results?.[0];
-  return found?.id || null;
-}
-
-async function createOrder(properties) {
-  return hubspotFetchJson("/crm/v3/objects/orders", {
-    method: "POST",
-    body: { properties },
-  });
-}
-
-async function updateOrder(orderId, properties) {
-  return hubspotFetchJson(`/crm/v3/objects/orders/${orderId}`, {
-    method: "PATCH",
-    body: { properties },
+    body: { idProperty, inputs },
   });
 }
 
@@ -116,104 +102,142 @@ export async function GET() {
   const startedAt = new Date().toISOString();
 
   try {
+    // ---- Config ----
     const baseUrl = requireEnv("CIN7_BASE_URL").replace(/\/$/, "");
     const path = requireEnv("CIN7_SALES_ORDERS_PATH"); // e.g. "/SalesOrders"
+
     const lookbackHours = Number(process.env.CIN7_LOOKBACK_HOURS || "48");
-    const since = isoUtcHoursAgo(lookbackHours);
+    const forcedSince = process.env.CIN7_FORCE_SINCE;
 
-    // IMPORTANT: This URL MUST match how your Cin7 Omni endpoint expects filtering.
-    // You previously learned InvoiceDate requires UTC datetime like yyyy-MM-ddTHH:mm:ssZ.
-    //
-    // Replace this querystring with the exact one that worked in Postman.
-    const where = `invoiceDate >= '${since}' AND invoiceDate IS NOT NULL`;
+    const since =
+      forcedSince && forcedSince.trim()
+        ? forcedSince.trim()
+        : isoUtcHoursAgo(lookbackHours);
 
-const cin7Url =
-  `${baseUrl}${path}` +
-  `?where=${encodeURIComponent(where)}` +
-  `&fields=id,reference,invoiceDate,stage,deliveryFirstName,deliveryLastName,deliveryCompany,deliveryAddress1,deliveryAddress2,deliveryCity,deliveryState,deliveryPostalCode,deliveryCountry,freightTotal,productTotal,total` +
-  `&order=invoiceDate` +
-  `&rows=50` +
-  `&page=1`;
+    // Pagination controls
+    const rows = Number(process.env.CIN7_ROWS || "250"); // try 250 (safe-ish). If Cin7 rejects, set to 50.
+    const maxPages = Number(process.env.CIN7_MAX_PAGES || "50");
 
-    console.log("[cin7-sync] started", { startedAt, since, cin7Url });
-
-    const cin7Data = await cin7FetchJson(cin7Url);
-
-    // Cin7 APIs vary: some return { items: [...] }, others return an array.
-    const salesOrders =
-      Array.isArray(cin7Data) ? cin7Data : (cin7Data?.items || cin7Data?.results || []);
-
-    console.log("[cin7-sync] fetched", { count: salesOrders.length });
-
-    // Pull HubSpot Order property names so we only send valid properties
+    // ---- HubSpot props ----
     const hsOrderProps = await getHubSpotOrderPropertyNames();
-
-    // Choose a unique property to store Cin7’s order id/number.
-    // BEST PRACTICE: Create a custom Order property in HubSpot called "cin7_order_id" (single-line text, unique).
-    // If you do that, set UNIQUE_PROP = "cin7_order_id".
     const UNIQUE_PROP = "cin7_order_id";
 
-    let created = 0;
-    let updated = 0;
+    if (!hsOrderProps.has(UNIQUE_PROP)) {
+      throw new Error(
+        `Missing HubSpot Order property "${UNIQUE_PROP}". Create it in HubSpot (Settings → Properties → Orders) as a single-line text field (unique if possible), then redeploy.`
+      );
+    }
+
+    // ---- Build Cin7 filter (matches what worked in Postman) ----
+    const where = `invoiceDate >= '${since}' AND invoiceDate IS NOT NULL`;
+
+    console.log("[cin7-sync] started", {
+      startedAt,
+      since,
+      rows,
+      maxPages,
+      forcedSince: Boolean(forcedSince && forcedSince.trim()),
+    });
+
+    // ---- Fetch Cin7 pages ----
+    let page = 1;
+    const allOrders = [];
+
+    while (true) {
+      const cin7Url =
+        `${baseUrl}${path}` +
+        `?where=${encodeURIComponent(where)}` +
+        `&fields=id,reference,invoiceDate,stage,deliveryFirstName,deliveryLastName,deliveryCompany,deliveryAddress1,deliveryAddress2,deliveryCity,deliveryState,deliveryPostalCode,deliveryCountry,freightTotal,productTotal,total` +
+        `&order=invoiceDate` +
+        `&rows=${rows}` +
+        `&page=${page}`;
+
+      console.log("[cin7-sync] fetching page", { page });
+
+      const cin7Data = await cin7FetchJson(cin7Url);
+      const orders = Array.isArray(cin7Data)
+        ? cin7Data
+        : (cin7Data?.items || cin7Data?.results || []);
+
+      if (!orders.length) break;
+
+      allOrders.push(...orders);
+      page += 1;
+
+      if (page > maxPages) {
+        console.log("[cin7-sync] reached maxPages safety valve", { maxPages });
+        break;
+      }
+    }
+
+    console.log("[cin7-sync] fetched from cin7", { count: allOrders.length });
+
+    // ---- Map to HubSpot upsert inputs ----
+    const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+    const inputs = [];
     let skipped = 0;
+
+    for (const o of allOrders) {
+      const cin7OrderId = String(o?.id || o?.Id || "").trim();
+      if (!cin7OrderId) {
+        skipped++;
+        continue;
+      }
+
+      // Totals — your Postman fields include productTotal / total / freightTotal
+      const orderTotal =
+        o?.total ?? o?.Total ?? o?.productTotal ?? o?.ProductTotal ?? null;
+
+      const candidateProps = {
+        [UNIQUE_PROP]: cin7OrderId,
+
+        // Helpful auditing fields (create these in HubSpot if you want to filter by them)
+        cin7_reference: o?.reference ?? null,
+        cin7_invoice_date: o?.invoiceDate ?? null,
+        cin7_last_synced_at: nowIso,
+
+        // Common Order fields (only written if they exist in your portal)
+        hs_order_number: o?.reference ?? cin7OrderId,
+        hs_total_price: orderTotal,
+        hs_currency_code: "USD",
+
+        // Shipping info (matches your Cin7 Postman fields)
+        ship_to_first_name: o?.deliveryFirstName ?? null,
+        ship_to_last_name: o?.deliveryLastName ?? null,
+        ship_to_company: o?.deliveryCompany ?? null,
+        ship_to_address: o?.deliveryAddress1 ?? null,
+        ship_to_address2: o?.deliveryAddress2 ?? null,
+        ship_to_city: o?.deliveryCity ?? null,
+        ship_to_state: o?.deliveryState ?? null,
+        ship_to_postal_code: o?.deliveryPostalCode ?? null,
+        ship_to_country: o?.deliveryCountry ?? null,
+      };
+
+      const properties = pickExistingProps(hsOrderProps, candidateProps);
+
+      inputs.push({
+        id: cin7OrderId, // <-- upsert key value
+        properties,
+      });
+    }
+
+    console.log("[cin7-sync] prepared upsert inputs", {
+      prepared: inputs.length,
+      skipped,
+    });
+
+    // ---- Batch upsert to HubSpot ----
+    const chunkSize = 100;
+    let upserted = 0;
     const errors = [];
 
-    for (const o of salesOrders) {
+    for (let i = 0; i < inputs.length; i += chunkSize) {
+      const chunk = inputs.slice(i, i + chunkSize);
+
       try {
-        // --- Adjust these fields to match what Cin7 returns in your payload ---
-        const cin7OrderId =
-          String(o?.Id || o?.id || o?.OrderId || o?.SalesOrderId || o?.OrderNumber || "").trim();
-
-        if (!cin7OrderId) {
-          skipped++;
-          continue;
-        }
-
-        const orderTotal =
-          o?.Total || o?.OrderTotal || o?.TotalAmount || o?.TotalInclTax || o?.InvoiceTotal;
-
-        const shipping = o?.ShippingAddress || o?.DeliveryAddress || {};
-        const shipLine1 = shipping?.Line1 || shipping?.Address1 || shipping?.Street;
-        const shipCity = shipping?.City;
-        const shipState = shipping?.State || shipping?.Region;
-        const shipPostal = shipping?.Postcode || shipping?.Zip;
-        const shipCountry = shipping?.Country;
-
-        // Candidate property names (we’ll only keep the ones that exist in your HubSpot portal)
-        const candidateProps = {
-          [UNIQUE_PROP]: cin7OrderId,
-
-          // Try common Order fields (may vary per portal)
-          hs_order_number: o?.OrderNumber || o?.OrderNo || cin7OrderId,
-          hs_total_price: orderTotal,
-          hs_currency_code: o?.Currency || o?.CurrencyCode || "USD",
-
-          // Shipping fields (may or may not exist in Orders; we only send if they exist)
-          ship_to_address: shipLine1,
-          ship_to_city: shipCity,
-          ship_to_state: shipState,
-          ship_to_postal_code: shipPostal,
-          ship_to_country: shipCountry,
-        };
-
-        const properties = pickExistingProps(hsOrderProps, candidateProps);
-
-        // Ensure the unique property exists before we proceed
-        if (!hsOrderProps.has(UNIQUE_PROP)) {
-          throw new Error(
-            `Missing HubSpot Order property "${UNIQUE_PROP}". Create it in HubSpot (Order properties) as a unique text field, then redeploy.`
-          );
-        }
-
-        const existingId = await findOrderByUniqueProperty(UNIQUE_PROP, cin7OrderId);
-
-        if (existingId) {
-          await updateOrder(existingId, properties);
-          updated++;
-        } else {
-          await createOrder(properties);
-          created++;
-        }
+        const res = await batchUpsertOrders(chunk, UNIQUE_PROP);
+        upserted += res?.results?.length || 0;
       } catch (e) {
         errors.push(String(e?.message || e));
       }
@@ -224,11 +248,13 @@ const cin7Url =
     console.log("[cin7-sync] complete", {
       startedAt,
       finishedAt,
-      fetched: salesOrders.length,
-      created,
-      updated,
+      since,
+      cin7Count: allOrders.length,
+      upsertPrepared: inputs.length,
+      upserted,
       skipped,
-      errors: errors.slice(0, 10),
+      errorsCount: errors.length,
+      sampleErrors: errors.slice(0, 3),
     });
 
     return Response.json({
@@ -236,9 +262,9 @@ const cin7Url =
       startedAt,
       finishedAt,
       since,
-      fetched: salesOrders.length,
-      created,
-      updated,
+      cin7Fetched: allOrders.length,
+      upsertPrepared: inputs.length,
+      upserted,
       skipped,
       errorsCount: errors.length,
       sampleErrors: errors.slice(0, 3),
