@@ -266,27 +266,38 @@ export async function GET() {
       try {
         const cin7OrderId = normalizeCin7Id(o);
         const orderTotal = normalizeTotal(o);
+        
+const fullName = [o?.deliveryFirstName, o?.deliveryLastName].filter(Boolean).join(" ").trim();
+const company = (o?.deliveryCompany || "").trim();
+const shippingName = (company || fullName || "").trim();
 
-        // Shipping fields (from the flat Cin7 fields we requested)
-        const candidateProps = {
-          [UNIQUE_PROP]: cin7OrderId,
+const street = [o?.deliveryAddress1, o?.deliveryAddress2]
+  .filter(Boolean)
+  .join(", ")
+  .trim();
 
-          // Optional: keep these only if they exist in your HubSpot Orders properties
-          hs_order_number: o?.reference || cin7OrderId,
-          hs_total_price: orderTotal,
-          hs_currency_code: "USD",
+const candidateProps = {
+  // idempotency key (your custom unique field)
+  [UNIQUE_PROP]: cin7OrderId,
 
-          ship_to_first_name: o?.deliveryFirstName,
-          ship_to_last_name: o?.deliveryLastName,
-          ship_to_company: o?.deliveryCompany,
-          ship_to_address: o?.deliveryAddress1,
-          ship_to_address_2: o?.deliveryAddress2,
-          ship_to_city: o?.deliveryCity,
-          ship_to_state: o?.deliveryState,
-          ship_to_postal_code: o?.deliveryPostalCode,
-          ship_to_country: o?.deliveryCountry,
-        };
+  // HubSpot standard order fields you confirmed exist
+  hs_order_name: o?.reference || cin7OrderId,
 
+  hs_currency_code: "USD",
+
+  // Totals
+  hs_subtotal_price: o?.productTotal,
+  hs_shipping_cost: o?.freightTotal,
+  hs_total_price: o?.total,
+
+  // Shipping
+  hs_shipping_address_name: shippingName,
+  hs_shipping_address_street: street,
+  hs_shipping_address_city: o?.deliveryCity,
+  hs_shipping_address_state: o?.deliveryState,
+  hs_shipping_address_postal_code: o?.deliveryPostalCode,
+  hs_shipping_address_country: o?.deliveryCountry,
+};
         const properties = pickExistingProps(hsOrderProps, candidateProps);
 
         const existingId = await findOrderByUniqueProperty(UNIQUE_PROP, cin7OrderId);
