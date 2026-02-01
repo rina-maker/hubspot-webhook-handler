@@ -1,8 +1,22 @@
 export const runtime = "nodejs";
 
 /**
- * Env helpers
+ * Cin7 → HubSpot Orders daily sync (idempotent without batch upsert)
+ *
+ * Env vars required:
+ *  - HUBSPOT_PRIVATE_APP_TOKEN
+ *  - CIN7_USERNAME
+ *  - CIN7_KEY
+ *  - CIN7_BASE_URL              e.g. https://api.cin7.com/api/v1
+ *  - CIN7_SALES_ORDERS_PATH     e.g. /SalesOrders
+ *
+ * Optional:
+ *  - CIN7_LOOKBACK_HOURS        default 48
+ *  - CIN7_FORCE_SINCE           ISO UTC datetime e.g. 2026-01-21T00:00:00Z
+ *  - CIN7_ROWS                  default 250
+ *  - CIN7_MAX_PAGES             default 50
  */
+
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -11,24 +25,19 @@ function requireEnv(name) {
 
 function isoUtcHoursAgo(hours) {
   const d = new Date(Date.now() - hours * 60 * 60 * 1000);
-  return d.toISOString().replace(/\.\d{3}Z$/, "Z"); // trim millis
+  // Trim millis so it matches Cin7 filter expectations
+  return d.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function safeJsonParse(text) {
-  try {
-    return text ? JSON.parse(text) : {};
-  } catch {
-    return { _raw: text };
-  }
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
-/**
- * Cin7
- */
 async function cin7FetchJson(url) {
   const username = requireEnv("CIN7_USERNAME");
   const key = requireEnv("CIN7_KEY");
-
   const auth = Buffer.from(`${username}:${key}`).toString("base64");
 
   const resp = await fetch(url, {
@@ -43,13 +52,9 @@ async function cin7FetchJson(url) {
   if (!resp.ok) {
     throw new Error(`Cin7 error ${resp.status}: ${text}`);
   }
-
-  return safeJsonParse(text);
+  return text ? JSON.parse(text) : {};
 }
 
-/**
- * HubSpot
- */
 async function hubspotFetchJson(path, { method = "GET", body } = {}) {
   const token = requireEnv("HUBSPOT_PRIVATE_APP_TOKEN");
 
@@ -67,8 +72,7 @@ async function hubspotFetchJson(path, { method = "GET", body } = {}) {
   if (!resp.ok) {
     throw new Error(`HubSpot error ${resp.status}: ${text}`);
   }
-
-  return safeJsonParse(text);
+  return text ? JSON.parse(text) : {};
 }
 
 async function getHubSpotOrderPropertyNames() {
@@ -84,78 +88,122 @@ function pickExistingProps(allNamesSet, candidateProps) {
   }
   return out;
 }
-/**
- * True idempotency:
- * Batch upsert Orders by a unique property (cin7_order_id).
- * If an order with that cin7_order_id exists -> update.
- * If not -> create.
- */
-async function batchUpsertOrders(inputs, idProperty) {
-  if (!idProperty) throw new Error("Missing idProperty for HubSpot upsert.");
-  if (!Array.isArray(inputs)) throw new Error("inputs must be an array.");
 
-  // HubSpot batch upsert REQUIRES idProperty at the TOP LEVEL
+async function findOrderByUniqueProperty(uniquePropName, uniqueValue) {
   const body = {
-    idProperty,
-    inputs: inputs.map((i) => ({
-      id: i.id,
-      properties: i.properties,
-    })),
+    filterGroups: [
+      {
+        filters: [
+          {
+            propertyName: uniquePropName,
+            operator: "EQ",
+            value: uniqueValue,
+          },
+        ],
+      },
+    ],
+    properties: [uniquePropName],
+    limit: 1,
   };
 
-  console.log("[cin7-sync] upsert payload shape", {
-    idProperty,
-    topLevelKeys: Object.keys(body),
-    firstInputKeys: Object.keys(body.inputs[0] || {}),
-  });
-
-  return hubspotFetchJson("/crm/v3/objects/orders/batch/upsert", {
+  const res = await hubspotFetchJson("/crm/v3/objects/orders/search", {
     method: "POST",
     body,
   });
+
+  const found = res?.results?.[0];
+  return found?.id || null;
 }
+
+async function createOrder(properties) {
+  return hubspotFetchJson("/crm/v3/objects/orders", {
+    method: "POST",
+    body: { properties },
+  });
+}
+
+async function updateOrder(orderId, properties) {
+  return hubspotFetchJson(`/crm/v3/objects/orders/${orderId}`, {
+    method: "PATCH",
+    body: { properties },
+  });
+}
+
+function normalizeCin7Id(o) {
+  return String(
+    o?.id ??
+      o?.Id ??
+      o?.OrderId ??
+      o?.SalesOrderId ??
+      o?.OrderNumber ??
+      o?.reference ??
+      ""
+  ).trim();
+}
+
+function normalizeTotal(o) {
+  return (
+    o?.total ??
+    o?.Total ??
+    o?.orderTotal ??
+    o?.OrderTotal ??
+    o?.totalAmount ??
+    o?.TotalAmount ??
+    o?.productTotal ??
+    o?.ProductTotal ??
+    null
+  );
+}
+
 export async function GET() {
   const startedAt = new Date().toISOString();
 
   try {
-    // ---- Config ----
+    // --- Cin7 env & time window ---
     const baseUrl = requireEnv("CIN7_BASE_URL").replace(/\/$/, "");
     const path = requireEnv("CIN7_SALES_ORDERS_PATH"); // e.g. "/SalesOrders"
 
     const lookbackHours = Number(process.env.CIN7_LOOKBACK_HOURS || "48");
-    const forcedSince = process.env.CIN7_FORCE_SINCE;
+    const forcedSinceRaw = process.env.CIN7_FORCE_SINCE;
+    const forcedSince = forcedSinceRaw && forcedSinceRaw.trim() ? forcedSinceRaw.trim() : null;
 
-    const since =
-      forcedSince && forcedSince.trim()
-        ? forcedSince.trim()
-        : isoUtcHoursAgo(lookbackHours);
+    const since = forcedSince || isoUtcHoursAgo(lookbackHours);
 
-    // Pagination controls
-    const rows = Number(process.env.CIN7_ROWS || "250"); // try 250 (safe-ish). If Cin7 rejects, set to 50.
+    // pagination controls
+    const rows = Number(process.env.CIN7_ROWS || "250");
     const maxPages = Number(process.env.CIN7_MAX_PAGES || "50");
-
-    // ---- HubSpot props ----
-    const hsOrderProps = await getHubSpotOrderPropertyNames();
-    const UNIQUE_PROP = "cin7_order_id";
-
-    if (!hsOrderProps.has(UNIQUE_PROP)) {
-      throw new Error(
-        `Missing HubSpot Order property "${UNIQUE_PROP}". Create it in HubSpot (Settings → Properties → Orders) as a single-line text field (unique if possible), then redeploy.`
-      );
-    }
-
-    // ---- Build Cin7 filter (matches what worked in Postman) ----
-    const where = `invoiceDate >= '${since}' AND invoiceDate IS NOT NULL`;
 
     console.log("[cin7-sync] started", {
       startedAt,
       since,
       rows,
       maxPages,
-      forcedSince: Boolean(forcedSince && forcedSince.trim()),
+      forcedSince: Boolean(forcedSince),
     });
 
-    // ---- Fetch Cin7 pages ----
+    // --- HubSpot: confirm the unique property exists ---
+    const hsOrderProps = await getHubSpotOrderPropertyNames();
+
+    // IMPORTANT: this must match the INTERNAL name in HubSpot Order properties
+    const UNIQUE_PROP = "cin7_order_id";
+
+    if (!hsOrderProps.has(UNIQUE_PROP)) {
+      throw new Error(
+        `Missing HubSpot Order property "${UNIQUE_PROP}". Create it in HubSpot (Orders properties) as single-line text (unique), then redeploy.`
+      );
+    }
+
+    // --- Build Cin7 filter (match what worked in Postman) ---
+    // InvoiceDate must be UTC ISO like 2026-01-21T00:00:00Z
+    const where = `invoiceDate >= '${since}' AND invoiceDate IS NOT NULL`;
+
+    // Pull the Cin7 fields you actually need
+    const fields =
+      "id,reference,invoiceDate,stage," +
+      "deliveryFirstName,deliveryLastName,deliveryCompany," +
+      "deliveryAddress1,deliveryAddress2,deliveryCity,deliveryState,deliveryPostalCode,deliveryCountry," +
+      "freightTotal,productTotal,total";
+
     let page = 1;
     const allOrders = [];
 
@@ -163,7 +211,7 @@ export async function GET() {
       const cin7Url =
         `${baseUrl}${path}` +
         `?where=${encodeURIComponent(where)}` +
-        `&fields=id,reference,invoiceDate,stage,deliveryFirstName,deliveryLastName,deliveryCompany,deliveryAddress1,deliveryAddress2,deliveryCity,deliveryState,deliveryPostalCode,deliveryCountry,freightTotal,productTotal,total` +
+        `&fields=${encodeURIComponent(fields)}` +
         `&order=invoiceDate` +
         `&rows=${rows}` +
         `&page=${page}`;
@@ -180,80 +228,70 @@ export async function GET() {
       allOrders.push(...orders);
       page += 1;
 
-      if (page > maxPages) {
-        console.log("[cin7-sync] reached maxPages safety valve", { maxPages });
-        break;
-      }
+      if (page > maxPages) break;
     }
 
     console.log("[cin7-sync] fetched from cin7", { count: allOrders.length });
 
-    // ---- Map to HubSpot upsert inputs ----
-    const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-
-    const inputs = [];
+    // --- Prepare upserts (dedupe by cin7 id) ---
+    const seen = new Set();
+    const prepared = [];
     let skipped = 0;
 
     for (const o of allOrders) {
-      const cin7OrderId = String(o?.id || o?.Id || "").trim();
+      const cin7OrderId = normalizeCin7Id(o);
       if (!cin7OrderId) {
         skipped++;
         continue;
       }
-
-      // Totals — your Postman fields include productTotal / total / freightTotal
-      const orderTotal =
-        o?.total ?? o?.Total ?? o?.productTotal ?? o?.ProductTotal ?? null;
-
-      const candidateProps = {
-        [UNIQUE_PROP]: cin7OrderId,
-
-        // Helpful auditing fields (create these in HubSpot if you want to filter by them)
-        cin7_reference: o?.reference ?? null,
-        cin7_invoice_date: o?.invoiceDate ?? null,
-        cin7_last_synced_at: nowIso,
-
-        // Common Order fields (only written if they exist in your portal)
-        hs_order_number: o?.reference ?? cin7OrderId,
-        hs_total_price: orderTotal,
-        hs_currency_code: "USD",
-
-        // Shipping info (matches your Cin7 Postman fields)
-        ship_to_first_name: o?.deliveryFirstName ?? null,
-        ship_to_last_name: o?.deliveryLastName ?? null,
-        ship_to_company: o?.deliveryCompany ?? null,
-        ship_to_address: o?.deliveryAddress1 ?? null,
-        ship_to_address2: o?.deliveryAddress2 ?? null,
-        ship_to_city: o?.deliveryCity ?? null,
-        ship_to_state: o?.deliveryState ?? null,
-        ship_to_postal_code: o?.deliveryPostalCode ?? null,
-        ship_to_country: o?.deliveryCountry ?? null,
-      };
-
-      const properties = pickExistingProps(hsOrderProps, candidateProps);
-
-      inputs.push({
-        id: cin7OrderId, // <-- upsert key value
-        properties,
-      });
+      if (seen.has(cin7OrderId)) continue;
+      seen.add(cin7OrderId);
+      prepared.push(o);
     }
 
-    console.log("[cin7-sync] prepared upsert inputs", {
-      prepared: inputs.length,
-      skipped,
-    });
+    console.log("[cin7-sync] prepared inputs", { prepared: prepared.length, skipped });
 
-    // ---- Batch upsert to HubSpot ----
-    const chunkSize = 100;
-    let upserted = 0;
+    // --- Upsert: search -> create/update ---
+    let created = 0;
+    let updated = 0;
     const errors = [];
 
-    for (let i = 0; i < inputs.length; i += chunkSize) {
-      const chunk = inputs.slice(i, i + chunkSize);
-
+    for (const o of prepared) {
       try {
-        const res = await batchUpsertOrders(chunk, UNIQUE_PROP);
-        upserted += res?.results?.length || 0;
+        const cin7OrderId = normalizeCin7Id(o);
+        const orderTotal = normalizeTotal(o);
+
+        // Shipping fields (from the flat Cin7 fields we requested)
+        const candidateProps = {
+          [UNIQUE_PROP]: cin7OrderId,
+
+          // Optional: keep these only if they exist in your HubSpot Orders properties
+          hs_order_number: o?.reference || cin7OrderId,
+          hs_total_price: orderTotal,
+          hs_currency_code: "USD",
+
+          ship_to_first_name: o?.deliveryFirstName,
+          ship_to_last_name: o?.deliveryLastName,
+          ship_to_company: o?.deliveryCompany,
+          ship_to_address: o?.deliveryAddress1,
+          ship_to_address_2: o?.deliveryAddress2,
+          ship_to_city: o?.deliveryCity,
+          ship_to_state: o?.deliveryState,
+          ship_to_postal_code: o?.deliveryPostalCode,
+          ship_to_country: o?.deliveryCountry,
+        };
+
+        const properties = pickExistingProps(hsOrderProps, candidateProps);
+
+        const existingId = await findOrderByUniqueProperty(UNIQUE_PROP, cin7OrderId);
+
+        if (existingId) {
+          await updateOrder(existingId, properties);
+          updated++;
+        } else {
+          await createOrder(properties);
+          created++;
+        }
       } catch (e) {
         errors.push(String(e?.message || e));
       }
@@ -266,11 +304,12 @@ export async function GET() {
       finishedAt,
       since,
       cin7Count: allOrders.length,
-      upsertPrepared: inputs.length,
-      upserted,
+      prepared: prepared.length,
+      created,
+      updated,
       skipped,
       errorsCount: errors.length,
-      sampleErrors: errors.slice(0, 3),
+      sampleErrors: errors.slice(0, 5),
     });
 
     return Response.json({
@@ -278,9 +317,10 @@ export async function GET() {
       startedAt,
       finishedAt,
       since,
-      cin7Fetched: allOrders.length,
-      upsertPrepared: inputs.length,
-      upserted,
+      cin7Count: allOrders.length,
+      prepared: prepared.length,
+      created,
+      updated,
       skipped,
       errorsCount: errors.length,
       sampleErrors: errors.slice(0, 3),
