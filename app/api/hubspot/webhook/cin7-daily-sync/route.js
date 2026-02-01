@@ -84,7 +84,6 @@ function pickExistingProps(allNamesSet, candidateProps) {
   }
   return out;
 }
-
 /**
  * True idempotency:
  * Batch upsert Orders by a unique property (cin7_order_id).
@@ -95,7 +94,20 @@ async function batchUpsertOrders(inputs, idProperty) {
   if (!idProperty) throw new Error("Missing idProperty for HubSpot upsert.");
   if (!Array.isArray(inputs)) throw new Error("inputs must be an array.");
 
-  const body = { idProperty, inputs };
+  // HubSpot batch upsert REQUIRES idProperty at the TOP LEVEL
+  const body = {
+    idProperty,
+    inputs: inputs.map((i) => ({
+      id: i.id,
+      properties: i.properties,
+    })),
+  };
+
+  console.log("[cin7-sync] upsert payload shape", {
+    idProperty,
+    topLevelKeys: Object.keys(body),
+    firstInputKeys: Object.keys(body.inputs[0] || {}),
+  });
 
   return hubspotFetchJson("/crm/v3/objects/orders/batch/upsert", {
     method: "POST",
