@@ -183,7 +183,13 @@ export async function GET() {
 
     // --- HubSpot: confirm the unique property exists ---
     const hsOrderProps = await getHubSpotOrderPropertyNames();
-
+  console.log("[cin7-sync] sample order props available", 
+  Array.from(hsOrderProps).filter(n =>
+    n.includes("ship") || n.includes("address") || n.includes("city") ||
+    n.includes("state") || n.includes("postal") || n.includes("country") ||
+    n.includes("name") || n.includes("total") || n.includes("currency")
+  ).slice(0, 200)
+);
     // IMPORTANT: this must match the INTERNAL name in HubSpot Order properties
     const UNIQUE_PROP = "cin7_order_id";
 
