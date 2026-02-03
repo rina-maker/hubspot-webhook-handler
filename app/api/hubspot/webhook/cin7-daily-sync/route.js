@@ -296,6 +296,8 @@ const candidateProps = {
   hs_shipping_address_state: o?.deliveryState,
   hs_shipping_address_postal_code: o?.deliveryPostalCode,
   hs_shipping_address_country: o?.deliveryCountry,
+    // ✅ Cin7 → HubSpot custom mapping
+  cin7_company: o?.billingCompany,
 };
         const properties = pickExistingProps(hsOrderProps, candidateProps);
 
