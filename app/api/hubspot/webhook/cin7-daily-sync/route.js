@@ -298,11 +298,11 @@ const candidateProps = {
   hs_shipping_address_country: o?.deliveryCountry,
     // ✅ Cin7 → HubSpot custom mapping
   cin7_company: o?.billingCompany,
-  console.log("[cin7-sync] billingCompany check", {
+};
+         console.log("[cin7-sync] billingCompany check", {
   cin7OrderId,
   billingCompany: o?.billingCompany,
 });
-};
         const properties = pickExistingProps(hsOrderProps, candidateProps);
 
         const existingId = await findOrderByUniqueProperty(UNIQUE_PROP, cin7OrderId);
