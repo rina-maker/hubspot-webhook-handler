@@ -281,7 +281,7 @@ const candidateProps = {
   [UNIQUE_PROP]: cin7OrderId,
 
   // Order identity
-  hs_order_name: `Cin7 Order ${o?.reference || cin7OrderId}`,
+  hs_order_name: cin7OrderId,
   hs_currency_code: "USD",
 
   // Totals
@@ -297,12 +297,9 @@ const candidateProps = {
   hs_shipping_address_postal_code: o?.deliveryPostalCode,
   hs_shipping_address_country: o?.deliveryCountry,
     // ✅ Cin7 → HubSpot custom mapping
-  cin7_company: o?.billingCompany,
+  cin7_company: o?.deliveryCompany,
+  hs_external_order_id: o?.customerOrderNo,
 };
-         console.log("[cin7-sync] billingCompany check", {
-  cin7OrderId,
-  billingCompany: o?.billingCompany,
-});
         const properties = pickExistingProps(hsOrderProps, candidateProps);
 
         const existingId = await findOrderByUniqueProperty(UNIQUE_PROP, cin7OrderId);
