@@ -267,22 +267,21 @@ export async function GET() {
         const cin7OrderId = normalizeCin7Id(o);
         const orderTotal = normalizeTotal(o);
         
-const fullName = [o?.deliveryFirstName, o?.deliveryLastName].filter(Boolean).join(" ").trim();
-const company = (o?.deliveryCompany || "").trim();
-const shippingName = (company || fullName || "").trim();
+const shippingName =
+  o?.deliveryCompany ||
+  `${o?.deliveryFirstName || ""} ${o?.deliveryLastName || ""}`.trim();
 
-const street = [o?.deliveryAddress1, o?.deliveryAddress2]
-  .filter(Boolean)
-  .join(", ")
-  .trim();
+const street =
+  o?.deliveryAddress1 ||
+  o?.deliveryAddress2 ||
+  "";
 
 const candidateProps = {
-  // idempotency key (your custom unique field)
+  // Idempotency key (custom unique property)
   [UNIQUE_PROP]: cin7OrderId,
 
-  // HubSpot standard order fields you confirmed exist
-  hs_order_name: o?.reference || cin7OrderId,
-
+  // Order identity
+  hs_order_name: `Cin7 Order ${o?.reference || cin7OrderId}`,
   hs_currency_code: "USD",
 
   // Totals
