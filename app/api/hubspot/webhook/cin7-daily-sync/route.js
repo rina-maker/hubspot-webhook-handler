@@ -298,6 +298,10 @@ const candidateProps = {
   hs_shipping_address_country: o?.deliveryCountry,
     // ✅ Cin7 → HubSpot custom mapping
   cin7_company: o?.billingCompany,
+  console.log("[cin7-sync] billingCompany check", {
+  cin7OrderId,
+  billingCompany: o?.billingCompany,
+});
 };
         const properties = pickExistingProps(hsOrderProps, candidateProps);
 
